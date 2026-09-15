@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-AgentRouter.org 自动签到脚本（修复版）
-- API 调用全部改为在 Playwright 浏览器内执行（page.evaluate + fetch），
-  由真实浏览器环境通过阿里云 WAF 的 JS 挑战，不再被拦截页糊脸
-- 修掉"响应文本包含 success 字样即判成功"的误判逻辑：
-  非 JSON 响应一律视为失败（原来会被 WAF 拦截页骗成假成功）
+AgentRouter.org 自动签到脚本（诊断增强版）
+- API 调用在 Playwright 浏览器内执行（page.evaluate + fetch）
+- 新增 WAF 挑战诊断：
+  1. 轮询等待 acw_sc__v2 挑战 cookie 出现（最多 4 轮 reload）
+  2. 失败时保存截图和页面 HTML 到 screenshots/ 目录
+  3. 区分"挑战没通过(ACW_SC_V2)"和"挑战通过但仍被拦(SIGN_WAF)"两种失败
 """
 
 import asyncio
@@ -111,6 +112,21 @@ def parse_json_safe(text):
 		return None
 
 
+async def dump_diagnostics(page, account_name, stage):
+	"""失败诊断：保存截图 + 页面HTML + 当前页面信息到 screenshots/ 目录"""
+	try:
+		os.makedirs('screenshots', exist_ok=True)
+		safe_name = ''.join(c if c.isalnum() else '_' for c in account_name)
+		await page.screenshot(path=f'screenshots/{safe_name}_{stage}.png', full_page=False)
+		html = await page.content()
+		with open(f'screenshots/{safe_name}_{stage}.html', 'w', encoding='utf-8') as f:
+			f.write(html)
+		print(f'[DIAG] {account_name}: screenshot saved -> screenshots/{safe_name}_{stage}.png')
+		print(f'[DIAG] {account_name}: page title = {await page.title()!r}, url = {page.url}')
+	except Exception as e:
+		print(f'[DIAG] {account_name}: dump diagnostics failed - {e}')
+
+
 async def check_in_account(account_info, account_index):
 	"""为单个账号执行签到操作：全程在真实浏览器内完成，天然过 WAF"""
 	account_name = get_account_display_name(account_info, account_index)
@@ -151,15 +167,37 @@ async def check_in_account(account_info, account_index):
 
 			page = await context.new_page()
 			try:
+				# ---- 第 1 步：访问站点，等待 WAF 挑战通过 ----
 				print(f'[PROCESSING] {account_name}: Step 1: Access site to pass WAF...')
-				await page.goto('https://agentrouter.org/login', wait_until='networkidle')
 				try:
-					await page.wait_for_function('document.readyState === "complete"', timeout=5000)
-				except Exception:
-					await page.wait_for_timeout(3000)
-				# 多给 WAF 的 JS 挑战一点执行时间
-				await page.wait_for_timeout(3000)
+					await page.goto('https://agentrouter.org/', wait_until='domcontentloaded', timeout=45000)
+				except Exception as e:
+					print(f'[WARN] {account_name}: goto error (continuing) - {str(e)[:100]}')
 
+				# 轮询等待 acw_sc__v2 挑战 cookie 出现（出现即代表 JS 挑战已通过）
+				waf_passed = False
+				for attempt in range(1, 5):
+					await page.wait_for_timeout(5000)
+					cookies_now = await context.cookies('https://agentrouter.org')
+					names = sorted(c['name'] for c in cookies_now)
+					print(f'[INFO] {account_name}: attempt {attempt} cookies = {names}')
+					if 'acw_sc__v2' in names:
+						waf_passed = True
+						print(f'[INFO] {account_name}: WAF challenge cookie (acw_sc__v2) acquired!')
+						break
+					# 挑战 cookie 没出现：reload 一次让挑战 JS 重新跑
+					try:
+						await page.reload(wait_until='domcontentloaded', timeout=30000)
+					except Exception:
+						pass
+
+				if not waf_passed:
+					print(f'[FAILED] {account_name}: WAF challenge NOT passed after 4 attempts (no acw_sc__v2 cookie).')
+					print(f'[FAILED] {account_name}: 当前出口IP被阿里云WAF判定为高风险(机房IP)，挑战可能是滑块/人工验证，脚本无法自动通过')
+					await dump_diagnostics(page, account_name, 'challenge_fail')
+					return False, None
+
+				# ---- 第 2 步：在已通过挑战的浏览器里调 API ----
 				print(f'[NETWORK] {account_name}: Executing check-in inside browser...')
 				api_result = await page.evaluate(
 					"""
@@ -186,9 +224,10 @@ async def check_in_account(account_info, account_index):
 					""",
 					api_user,
 				)
+				print(f'[NETWORK] {account_name}: self HTTP {api_result.get("selfStatus")}, sign HTTP {api_result.get("signStatus")}')
 			except Exception as e:
 				print(f'[FAILED] {account_name}: Browser flow error - {str(e)[:120]}')
-				await context.close()
+				await dump_diagnostics(page, account_name, 'flow_error')
 				return False, None
 			finally:
 				try:
@@ -223,6 +262,7 @@ async def check_in_account(account_info, account_index):
 	if sign_j is None:
 		preview = (sign_text or api_result.get('signError') or '')[:80].replace('\n', ' ')
 		print(f'[FAILED] {account_name}: 签到响应不是JSON(WAF拦截页)，签到未执行: {preview}')
+		print(f'[FAILED] {account_name}: 挑战cookie虽已拿到，但API请求仍被WAF拦截 -> 该IP/API路径被持续拦截，建议更换运行环境')
 		return False, user_info
 
 	if sign_j.get('success') is True or sign_j.get('ret') == 1 or sign_j.get('code') == 0:
