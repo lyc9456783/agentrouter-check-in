@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """
-AgentRouter.org 自动签到脚本
+AgentRouter.org 自动签到脚本（修复版）
+- API 调用全部改为在 Playwright 浏览器内执行（page.evaluate + fetch），
+  由真实浏览器环境通过阿里云 WAF 的 JS 挑战，不再被拦截页糊脸
+- 修掉"响应文本包含 success 字样即判成功"的误判逻辑：
+  非 JSON 响应一律视为失败（原来会被 WAF 拦截页骗成假成功）
 """
 
 import asyncio
@@ -10,7 +14,6 @@ import os
 import sys
 from datetime import datetime
 
-import httpx
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright
 
@@ -31,12 +34,10 @@ def load_accounts():
 	try:
 		accounts_data = json.loads(accounts_str)
 
-		# 检查是否为数组格式
 		if not isinstance(accounts_data, list):
 			print('ERROR: Account configuration must use array format [{}]')
 			return None
 
-		# 验证账号数据格式
 		for i, account in enumerate(accounts_data):
 			if not isinstance(account, dict):
 				print(f'ERROR: Account {i + 1} configuration format is incorrect')
@@ -44,7 +45,6 @@ def load_accounts():
 			if 'cookies' not in account or 'api_user' not in account:
 				print(f'ERROR: Account {i + 1} missing required fields (cookies, api_user)')
 				return None
-			# 如果有 name 字段，确保它不是空字符串
 			if 'name' in account and not account['name']:
 				print(f'ERROR: Account {i + 1} name field cannot be empty')
 				return None
@@ -77,7 +77,6 @@ def save_balance_hash(balance_hash):
 
 def generate_balance_hash(balances):
 	"""生成余额数据的hash"""
-	# 将包含 quota 和 used 的结构转换为简单的 quota 值用于 hash 计算
 	simple_balances = {k: v['quota'] for k, v in balances.items()} if balances else {}
 	balance_json = json.dumps(simple_balances, sort_keys=True, separators=(',', ':'))
 	return hashlib.sha256(balance_json.encode('utf-8')).hexdigest()[:16]
@@ -92,7 +91,6 @@ def parse_cookies(cookies_data):
 	"""解析 cookies 数据"""
 	if isinstance(cookies_data, dict):
 		return cookies_data
-
 	if isinstance(cookies_data, str):
 		cookies_dict = {}
 		for cookie in cookies_data.split(';'):
@@ -103,9 +101,30 @@ def parse_cookies(cookies_data):
 	return {}
 
 
-async def get_waf_cookies_with_playwright(account_name: str):
-	"""使用 Playwright 获取 WAF cookies（隐私模式）"""
-	print(f'[PROCESSING] {account_name}: Starting browser to get WAF cookies...')
+def parse_json_safe(text):
+	"""严格 JSON 解析：解析失败返回 None（绝不拿 HTML 拦截页凑数）"""
+	if not text:
+		return None
+	try:
+		return json.loads(text)
+	except Exception:
+		return None
+
+
+async def check_in_account(account_info, account_index):
+	"""为单个账号执行签到操作：全程在真实浏览器内完成，天然过 WAF"""
+	account_name = get_account_display_name(account_info, account_index)
+	print(f'\n[PROCESSING] Starting to process {account_name}')
+
+	cookies_data = parse_cookies(account_info.get('cookies', {}))
+	api_user = account_info.get('api_user', '')
+
+	if not api_user:
+		print(f'[FAILED] {account_name}: API user identifier not found')
+		return False, None
+	if not cookies_data:
+		print(f'[FAILED] {account_name}: Invalid configuration format')
+		return False, None
 
 	async with async_playwright() as p:
 		import tempfile
@@ -122,174 +141,103 @@ async def get_waf_cookies_with_playwright(account_name: str):
 					'--disable-features=VizDisplayCompositor',
 					'--no-sandbox',
 				],
-				)
+			)
+
+			# 先把用户的 session cookie 注入浏览器，再访问页面
+			cookie_list = []
+			for k, v in cookies_data.items():
+				cookie_list.append({'name': k, 'value': v, 'domain': 'agentrouter.org', 'path': '/'})
+			await context.add_cookies(cookie_list)
 
 			page = await context.new_page()
-
 			try:
-				print(f'[PROCESSING] {account_name}: Step 1: Access login page to get initial cookies...')
-
+				print(f'[PROCESSING] {account_name}: Step 1: Access site to pass WAF...')
 				await page.goto('https://agentrouter.org/login', wait_until='networkidle')
-
 				try:
 					await page.wait_for_function('document.readyState === "complete"', timeout=5000)
 				except Exception:
 					await page.wait_for_timeout(3000)
+				# 多给 WAF 的 JS 挑战一点执行时间
+				await page.wait_for_timeout(3000)
 
-				cookies = await page.context.cookies()
-
-				waf_cookies = {}
-				for cookie in cookies:
-					cookie_name = cookie.get('name')
-					cookie_value = cookie.get('value')
-					if cookie_name in ['acw_tc', 'cdn_sec_tc', 'acw_sc__v2'] and cookie_value is not None:
-						waf_cookies[cookie_name] = cookie_value
-
-				print(f'[INFO] {account_name}: Got {len(waf_cookies)} WAF cookies after step 1')
-
-				# AgentRouter 可能不需要所有 WAF cookies，只要有至少一个即可
-				if not waf_cookies:
-					print(f'[WARN] {account_name}: No WAF cookies found, proceeding anyway')
-				else:
-					print(f'[SUCCESS] {account_name}: Got WAF cookies: {list(waf_cookies.keys())}')
-
-				await context.close()
-
-				return waf_cookies
-
+				print(f'[NETWORK] {account_name}: Executing check-in inside browser...')
+				api_result = await page.evaluate(
+					"""
+					async (apiUser) => {
+						const out = {};
+						const headers = {
+							'new-api-user': String(apiUser),
+							'Content-Type': 'application/json',
+						};
+						try {
+							const r = await fetch('/api/user/self', {headers, credentials: 'include'});
+							out.selfStatus = r.status;
+							out.selfText = await r.text();
+						} catch (e) { out.selfError = String(e); }
+						try {
+							const r = await fetch('/api/user/sign_in', {
+								method: 'POST', headers, credentials: 'include',
+							});
+							out.signStatus = r.status;
+							out.signText = await r.text();
+						} catch (e) { out.signError = String(e); }
+						return out;
+					}
+					""",
+					api_user,
+				)
 			except Exception as e:
-				print(f'[FAILED] {account_name}: Error occurred while getting WAF cookies: {e}')
+				print(f'[FAILED] {account_name}: Browser flow error - {str(e)[:120]}')
 				await context.close()
-				return None
+				return False, None
+			finally:
+				try:
+					await context.close()
+				except Exception:
+					pass
 
+	# ---- 严格解析：非 JSON 一律失败 ----
+	self_text = api_result.get('selfText') or ''
+	sign_text = api_result.get('signText') or ''
 
-def get_user_info(client, headers):
-	"""获取用户信息"""
-	try:
-		response = client.get('https://agentrouter.org/api/user/self', headers=headers, timeout=30)
-
-		if response.status_code == 200:
-			# 检查响应内容是否为空
-			if not response.text or not response.text.strip():
-				return {'success': False, 'error': 'Empty response from API'}
-			try:
-				data = response.json()
-			except json.JSONDecodeError:
-				return {'success': False, 'error': f'Invalid JSON response: {response.text[:100]}'}
-			if data.get('success'):
-				user_data = data.get('data', {})
-				quota = round(user_data.get('quota', 0) / 500000, 2)
-				used_quota = round(user_data.get('used_quota', 0) / 500000, 2)
-				return {
-					'success': True,
-					'quota': quota,
-					'used_quota': used_quota,
-					'display': f':money: Current balance: ${quota}, Used: ${used_quota}'
-				}
-			return {'success': False, 'error': f'API returned: {data.get("message", "Unknown error")}'}
-		return {'success': False, 'error': f'HTTP {response.status_code}: {response.text[:100] if response.text else "No content"}'}
-	except Exception as e:
-		return {'success': False, 'error': f'Failed to get user info: {str(e)[:100]}'}
-
-
-async def check_in_account(account_info, account_index):
-	"""为单个账号执行签到操作"""
-	account_name = get_account_display_name(account_info, account_index)
-	print(f'\n[PROCESSING] Starting to process {account_name}')
-
-	# 解析账号配置
-	cookies_data = account_info.get('cookies', {})
-	api_user = account_info.get('api_user', '')
-
-	if not api_user:
-		print(f'[FAILED] {account_name}: API user identifier not found')
-		return False, None
-
-	# 解析用户 cookies
-	user_cookies = parse_cookies(cookies_data)
-	if not user_cookies:
-		print(f'[FAILED] {account_name}: Invalid configuration format')
-		return False, None
-
-	# 步骤1：获取 WAF cookies
-	waf_cookies = await get_waf_cookies_with_playwright(account_name)
-	if not waf_cookies:
-		print(f'[FAILED] {account_name}: Unable to get WAF cookies')
-		return False, None
-
-	# 步骤2：使用 httpx 进行 API 请求
-	client = httpx.Client(http2=True, timeout=30.0)
-
-	try:
-		# 合并 WAF cookies 和用户 cookies
-		all_cookies = {**waf_cookies, **user_cookies}
-		client.cookies.update(all_cookies)
-
-		headers = {
-			'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36',
-			'Accept': 'application/json, text/plain, */*',
-			'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-			'Accept-Encoding': 'gzip, deflate, br, zstd',
-			'Referer': 'https://agentrouter.org/console',
-			'Origin': 'https://agentrouter.org',
-			'Connection': 'keep-alive',
-			'Sec-Fetch-Dest': 'empty',
-			'Sec-Fetch-Mode': 'cors',
-			'Sec-Fetch-Site': 'same-origin',
-			'new-api-user': api_user,
+	self_j = parse_json_safe(self_text)
+	user_info = {'success': False}
+	if self_j is None:
+		preview = (self_text or api_result.get('selfError') or '')[:80].replace('\n', ' ')
+		user_info['error'] = f'用户信息接口非JSON(WAF拦截?) {preview}'
+		print(f'[WARN] {account_name}: {user_info["error"]}')
+	elif self_j.get('success') is True:
+		d = self_j.get('data') or {}
+		quota = round(d.get('quota', 0) / 500000, 2)
+		used = round(d.get('used_quota', 0) / 500000, 2)
+		user_info = {
+			'success': True, 'quota': quota, 'used_quota': used,
+			'display': f'Current balance: ${quota}, Used: ${used}',
 		}
+		print(f'[INFO] {account_name}: {user_info["display"]}')
+	else:
+		user_info['error'] = f'用户信息接口: {self_j.get("message", "Unknown error")}'
+		print(f'[WARN] {account_name}: {user_info["error"]}')
 
-		user_info = get_user_info(client, headers)
-		if user_info and user_info.get('success'):
-			print(user_info['display'])
-		elif user_info:
-			print(user_info.get('error', 'Unknown error'))
+	sign_j = parse_json_safe(sign_text)
+	if sign_j is None:
+		preview = (sign_text or api_result.get('signError') or '')[:80].replace('\n', ' ')
+		print(f'[FAILED] {account_name}: 签到响应不是JSON(WAF拦截页)，签到未执行: {preview}')
+		return False, user_info
 
-		print(f'[NETWORK] {account_name}: Executing check-in')
+	if sign_j.get('success') is True or sign_j.get('ret') == 1 or sign_j.get('code') == 0:
+		print(f'[SUCCESS] {account_name}: Check-in successful!')
+		return True, user_info
 
-		# 更新签到请求头
-		checkin_headers = headers.copy()
-		checkin_headers.update({'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest'})
-
-		response = client.post('https://agentrouter.org/api/user/sign_in', headers=checkin_headers, timeout=30)
-
-		print(f'[RESPONSE] {account_name}: Response status code {response.status_code}')
-
-		if response.status_code == 200:
-			try:
-				result = response.json()
-				if result.get('ret') == 1 or result.get('code') == 0 or result.get('success'):
-					print(f'[SUCCESS] {account_name}: Check-in successful!')
-					return True, user_info
-				else:
-					error_msg = result.get('msg', result.get('message', 'Unknown error'))
-					print(f'[FAILED] {account_name}: Check-in failed - {error_msg}')
-					return False, user_info
-			except json.JSONDecodeError:
-				# 如果不是 JSON 响应，检查是否包含成功标识
-				if 'success' in response.text.lower():
-					print(f'[SUCCESS] {account_name}: Check-in successful!')
-					return True, user_info
-				else:
-					print(f'[FAILED] {account_name}: Check-in failed - Invalid response format')
-					return False, user_info
-		else:
-			print(f'[FAILED] {account_name}: Check-in failed - HTTP {response.status_code}')
-			return False, user_info
-
-	except Exception as e:
-		print(f'[FAILED] {account_name}: Error occurred during check-in process - {str(e)[:50]}...')
-		return False, None
-	finally:
-		client.close()
+	print(f'[FAILED] {account_name}: Check-in failed - {sign_j.get("msg") or sign_j.get("message") or sign_text[:120]}')
+	return False, user_info
 
 
 async def main():
 	"""主函数"""
-	print('[SYSTEM] AgentRouter.org multi-account auto check-in script started (using Playwright)')
+	print('[SYSTEM] AgentRouter.org multi-account auto check-in started (browser-based)')
 	print(f'[TIME] Execution time: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}')
 
-	# 加载账号配置
 	accounts = load_accounts()
 	if not accounts:
 		print('[FAILED] Unable to load account configuration, program exits')
@@ -297,16 +245,14 @@ async def main():
 
 	print(f'[INFO] Found {len(accounts)} account configurations')
 
-	# 加载余额hash
 	last_balance_hash = load_balance_hash()
 
-	# 为每个账号执行签到
 	success_count = 0
 	total_count = len(accounts)
 	notification_content = []
 	current_balances = {}
-	need_notify = False  # 是否需要发送通知
-	balance_changed = False  # 余额是否有变化
+	need_notify = False
+	balance_changed = False
 
 	for i, account in enumerate(accounts):
 		account_key = f'account_{i + 1}'
@@ -314,25 +260,8 @@ async def main():
 			success, user_info = await check_in_account(account, i)
 			if success:
 				success_count += 1
-
-			# 检查是否需要通知
-			should_notify_this_account = False
-
-			# 如果签到失败，需要通知
-			if not success:
-				should_notify_this_account = True
+			else:
 				need_notify = True
-				account_name = get_account_display_name(account, i)
-				print(f'[NOTIFY] {account_name} failed, will send notification')
-
-			# 收集余额数据
-			if user_info and user_info.get('success'):
-				current_quota = user_info['quota']
-				current_used = user_info['used_quota']
-				current_balances[account_key] = {'quota': current_quota, 'used': current_used}
-
-			# 只有需要通知的账号才收集内容
-			if should_notify_this_account:
 				account_name = get_account_display_name(account, i)
 				status = '[SUCCESS]' if success else '[FAIL]'
 				account_result = f'{status} {account_name}'
@@ -342,53 +271,47 @@ async def main():
 					account_result += f'\n{user_info.get("error", "Unknown error")}'
 				notification_content.append(account_result)
 
+			if user_info and user_info.get('success'):
+				current_balances[account_key] = {'quota': user_info['quota'], 'used': user_info['used_quota']}
+
 		except Exception as e:
 			account_name = get_account_display_name(account, i)
 			print(f'[FAILED] {account_name} processing exception: {e}')
-			need_notify = True  # 异常也需要通知
+			need_notify = True
 			notification_content.append(f'[FAIL] {account_name} exception: {str(e)[:50]}...')
 
-	# 检查余额变化
 	current_balance_hash = generate_balance_hash(current_balances) if current_balances else None
 	if current_balance_hash:
 		if last_balance_hash is None:
-			# 首次运行
 			balance_changed = True
 			need_notify = True
 			print('[NOTIFY] First run detected, will send notification with current balances')
 		elif current_balance_hash != last_balance_hash:
-			# 余额有变化
 			balance_changed = True
 			need_notify = True
 			print('[NOTIFY] Balance changes detected, will send notification')
 		else:
 			print('[INFO] No balance changes detected')
 
-	# 为有余额变化的情况添加所有成功账号到通知内容
 	if balance_changed:
 		for i, account in enumerate(accounts):
 			account_key = f'account_{i + 1}'
 			if account_key in current_balances:
 				account_name = get_account_display_name(account, i)
-				# 只添加成功获取余额的账号，且避免重复添加
 				account_result = f'[BALANCE] {account_name}'
 				account_result += f'\n:money: Current balance: ${current_balances[account_key]["quota"]}, Used: ${current_balances[account_key]["used"]}'
-				# 检查是否已经在通知内容中（避免重复）
 				if not any(account_name in item for item in notification_content):
 					notification_content.append(account_result)
 
-	# 保存当前余额hash
 	if current_balance_hash:
 		save_balance_hash(current_balance_hash)
 
 	if need_notify and notification_content:
-		# 构建通知内容
 		summary = [
 			'[STATS] Check-in result statistics:',
 			f'[SUCCESS] Success: {success_count}/{total_count}',
 			f'[FAIL] Failed: {total_count - success_count}/{total_count}',
 		]
-
 		if success_count == total_count:
 			summary.append('[SUCCESS] All accounts check-in successful!')
 		elif success_count > 0:
@@ -397,16 +320,13 @@ async def main():
 			summary.append('[ERROR] All accounts check-in failed')
 
 		time_info = f'[TIME] Execution time: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}'
-
 		notify_content = '\n\n'.join([time_info, '\n'.join(notification_content), '\n'.join(summary)])
-
 		print(notify_content)
 		notify.push_message('AgentRouter Check-in Alert', notify_content, msg_type='text')
 		print('[NOTIFY] Notification sent due to failures or balance changes')
 	else:
 		print('[INFO] All accounts successful and no balance changes detected, notification skipped')
 
-	# 设置退出码
 	sys.exit(0 if success_count > 0 else 1)
 
 
